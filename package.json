@@ -1,0 +1,23 @@
+{
+  "name": "biker-lab-thibault-forwarder",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Forwards Shopify orders containing Supplier-Thibault-tagged line items to Importations Thibault's Order API.",
+  "main": "api/webhooks/orders-create.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "node scripts/dev-server.js",
+    "test:order": "node scripts/send-test-order.js",
+    "test:token-refresh": "node scripts/test-admin-token-refresh.js",
+    "test:unresolved-item": "node scripts/test-unresolved-item.js",
+    "test:alert": "node scripts/test-alert.js",
+    "test:alert-throttle": "node scripts/test-alert-throttle.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "resend": "^6.25.0"
+  }
+}

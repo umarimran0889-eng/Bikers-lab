@@ -1,0 +1,187 @@
+const { verifyShopifyWebhook } = require('../../lib/verifyWebhook');
+const { getThibaultLineItems, buildThibaultOrderPayloads } = require('../../lib/mapOrderToThibault');
+const { submitThibaultOrder } = require('../../lib/thibaultClient');
+const { hasBeenProcessed, markProcessed } = require('../../lib/dedupeStore');
+const { logEvent } = require('../../lib/logger');
+const { logUnresolvedItem } = require('../../lib/unresolvedItemsLog');
+const { sendFailureAlert } = require('../../lib/alerts');
+
+// Disables Vercel/Next's automatic body parsing so we can read the exact raw
+// bytes Shopify signed. Harmless locally; matters once this is deployed.
+const config = { api: { bodyParser: false } };
+
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res, statusCode, body) {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify(body));
+}
+
+async function ordersCreateHandler(req, res) {
+  if (req.method !== 'POST') {
+    res.statusCode = 405;
+    return res.end('Method Not Allowed');
+  }
+
+  let rawBody;
+  if (Buffer.isBuffer(req.body)) {
+    rawBody = req.body;
+  } else if (typeof req.body === 'string') {
+    rawBody = Buffer.from(req.body);
+  } else {
+    rawBody = await readRawBody(req);
+  }
+
+  const hmacHeader = req.headers['x-shopify-hmac-sha256'];
+  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+
+  if (!verifyShopifyWebhook(rawBody, hmacHeader, secret)) {
+    logEvent({ level: 'warn', message: 'Webhook HMAC verification failed' });
+    return sendJson(res, 401, { error: 'Invalid webhook signature' });
+  }
+
+  let order;
+  try {
+    order = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    return sendJson(res, 400, { error: 'Invalid JSON body' });
+  }
+
+  const orderId = order.id;
+
+  // Catch-all safety net: anything unexpected past this point (a bug, an
+  // I/O error, whatever) gets logged AND alerted, instead of failing
+  // completely silently with just a stack trace in a terminal no one is
+  // watching.
+  try {
+    return await processOrder({ req, res, order, orderId });
+  } catch (err) {
+    logEvent({
+      level: 'error',
+      orderId,
+      message: 'Unhandled error in orders-create handler',
+      error: err.message,
+      stack: err.stack,
+    });
+    await sendFailureAlert('unhandled_error', {
+      orderId,
+      orderName: order.name || order.order_number,
+      error: err.message,
+      stack: err.stack,
+    });
+    if (!res.headersSent) {
+      return sendJson(res, 500, { status: 'error', error: 'Internal Server Error' });
+    }
+  }
+}
+
+async function processOrder({ res, order, orderId }) {
+  if (hasBeenProcessed(orderId)) {
+    logEvent({ level: 'info', orderId, message: 'Duplicate webhook delivery, already processed - skipping' });
+    return sendJson(res, 200, { status: 'skipped', reason: 'duplicate' });
+  }
+
+  const { matchedItems, unresolvedItems } = await getThibaultLineItems(order);
+
+  // "Unresolved" (tag lookup failed after retries) is distinct from
+  // "confirmed not Thibault" - it must never be silently dropped, and must
+  // never block matchedItems from being forwarded normally.
+  for (const li of unresolvedItems) {
+    logUnresolvedItem({
+      orderId,
+      orderName: order.name || order.order_number,
+      productId: li.product_id,
+      sku: li.sku,
+      lineItemId: li.id,
+      error: li._tagLookupError,
+    });
+    await sendFailureAlert('unresolved_item', {
+      orderId,
+      orderName: order.name || order.order_number,
+      productId: li.product_id,
+      sku: li.sku,
+      lineItemId: li.id,
+      lookupError: li._tagLookupError,
+    });
+  }
+
+  if (matchedItems.length === 0) {
+    logEvent({
+      level: 'info',
+      orderId,
+      message: 'No confirmed Thibault line items on this order - skipping',
+      unresolvedCount: unresolvedItems.length,
+    });
+    return sendJson(res, 200, {
+      status: 'skipped',
+      reason: 'no_thibault_items',
+      unresolvedCount: unresolvedItems.length,
+    });
+  }
+
+  const orderRequests = buildThibaultOrderPayloads(order, matchedItems);
+  const results = [];
+
+  // One POST /api/v1/order call per SKU - Thibault's documented request body
+  // only supports a single {sku, qty} under "item", not an array of items.
+  for (const { sku, payload } of orderRequests) {
+    try {
+      const response = await submitThibaultOrder(payload);
+      const simulated = Boolean(response && response.simulated);
+      logEvent({
+        level: 'info',
+        orderId,
+        sku,
+        message: simulated
+          ? 'Simulated Thibault order (THIBAULT_LIVE_CALLS_ENABLED is not "true" - no real call was made)'
+          : 'Forwarded to Thibault',
+        simulated,
+        thibaultOrderNumber: response && response.order_number,
+      });
+      results.push({
+        sku,
+        status: 'success',
+        simulated,
+        thibaultOrderNumber: response && response.order_number,
+      });
+    } catch (err) {
+      logEvent({
+        level: 'error',
+        orderId,
+        sku,
+        message: 'Thibault API error',
+        error: err.message,
+        thibaultResponse: err.response,
+      });
+      await sendFailureAlert('thibault_rejection', {
+        orderId,
+        orderName: order.name || order.order_number,
+        sku,
+        orderPayload: payload,
+        thibaultError: err.message,
+        thibaultResponse: err.response,
+      });
+      results.push({ sku, status: 'error', error: err.message });
+    }
+  }
+
+  markProcessed(orderId, { results, unresolvedCount: unresolvedItems.length });
+
+  const anyFailed = results.some((r) => r.status === 'error');
+  return sendJson(res, anyFailed ? 207 : 200, {
+    status: anyFailed ? 'partial_failure' : 'success',
+    results,
+    unresolvedCount: unresolvedItems.length,
+  });
+}
+
+module.exports = ordersCreateHandler;
+module.exports.config = config;

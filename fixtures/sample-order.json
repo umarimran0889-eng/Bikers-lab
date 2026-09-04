@@ -1,0 +1,59 @@
+{
+  "id": 5551234567890,
+  "order_number": 1042,
+  "name": "#1042",
+  "note": "Please leave at back door if no answer",
+  "tags": "",
+  "currency": "CAD",
+  "phone": "+15145551234",
+  "customer": {
+    "id": 823456789,
+    "first_name": "Alex",
+    "last_name": "Tremblay",
+    "email": "alex.tremblay@example.com",
+    "phone": "+15145551234"
+  },
+  "shipping_address": {
+    "first_name": "Alex",
+    "last_name": "Tremblay",
+    "company": "",
+    "address1": "123 Rue Principale",
+    "address2": "Apt 4",
+    "city": "Montreal",
+    "province": "Quebec",
+    "province_code": "QC",
+    "zip": "H2X 1Y6",
+    "country": "Canada",
+    "country_code": "CA",
+    "phone": "+15145551234"
+  },
+  "line_items": [
+    {
+      "id": 998877001,
+      "product_id": 7001234567,
+      "sku": "TH-4521",
+      "title": "Brake Pad Set",
+      "vendor": "All Balls",
+      "quantity": 2,
+      "price": "89.99"
+    },
+    {
+      "id": 998877002,
+      "product_id": 7001234999,
+      "sku": "TH-9981",
+      "title": "Clutch Cable",
+      "vendor": "K&S",
+      "quantity": 1,
+      "price": "34.50"
+    },
+    {
+      "id": 998877003,
+      "product_id": 7009998888,
+      "sku": "GEN-1001",
+      "title": "Generic Helmet Visor",
+      "vendor": "Scar",
+      "quantity": 1,
+      "price": "24.99"
+    }
+  ]
+}

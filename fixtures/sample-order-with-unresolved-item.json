@@ -1,0 +1,59 @@
+{
+  "id": 5551234567999,
+  "order_number": 1043,
+  "name": "#1043",
+  "note": "Test order with one unresolvable tag lookup",
+  "tags": "",
+  "currency": "CAD",
+  "phone": "+15145551234",
+  "customer": {
+    "id": 823456790,
+    "first_name": "Jamie",
+    "last_name": "Roy",
+    "email": "jamie.roy@example.com",
+    "phone": "+15145551234"
+  },
+  "shipping_address": {
+    "first_name": "Jamie",
+    "last_name": "Roy",
+    "company": "",
+    "address1": "45 Avenue des Pins",
+    "address2": "",
+    "city": "Quebec City",
+    "province": "Quebec",
+    "province_code": "QC",
+    "zip": "G1R 2K5",
+    "country": "Canada",
+    "country_code": "CA",
+    "phone": "+15145551234"
+  },
+  "line_items": [
+    {
+      "id": 998877101,
+      "product_id": 7001234567,
+      "sku": "TH-4521",
+      "title": "Brake Pad Set",
+      "vendor": "All Balls",
+      "quantity": 1,
+      "price": "89.99"
+    },
+    {
+      "id": 998877102,
+      "product_id": 7009998888,
+      "sku": "GEN-1001",
+      "title": "Generic Helmet Visor",
+      "vendor": "Scar",
+      "quantity": 1,
+      "price": "24.99"
+    },
+    {
+      "id": 998877103,
+      "product_id": 7005550001,
+      "sku": "TH-UNRESOLVED-1",
+      "title": "Product whose tag lookup always fails (test fixture)",
+      "vendor": "Koubalinks",
+      "quantity": 1,
+      "price": "49.99"
+    }
+  ]
+}
