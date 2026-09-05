@@ -1,10 +1,11 @@
 const { verifyShopifyWebhook } = require('../../lib/verifyWebhook');
 const { getThibaultLineItems, buildThibaultOrderPayloads } = require('../../lib/mapOrderToThibault');
-const { submitThibaultOrder } = require('../../lib/thibaultClient');
+const { submitThibaultOrder, checkThibaultInvoice } = require('../../lib/thibaultClient');
 const { hasBeenProcessed, markProcessed } = require('../../lib/dedupeStore');
 const { logEvent } = require('../../lib/logger');
 const { logUnresolvedItem } = require('../../lib/unresolvedItemsLog');
 const { sendFailureAlert } = require('../../lib/alerts');
+const { recordPendingStatus, markSent, markFailed, markConfirmed } = require('../../lib/orderStatus');
 
 // Disables Vercel/Next's automatic body parsing so we can read the exact raw
 // bytes Shopify signed. Harmless locally; matters once this is deployed.
@@ -133,6 +134,15 @@ async function processOrder({ res, order, orderId }) {
   // One POST /api/v1/order call per SKU - Thibault's documented request body
   // only supports a single {sku, qty} under "item", not an array of items.
   for (const { sku, payload } of orderRequests) {
+    // Written as soon as this SKU is confirmed Thibault-bound, before the
+    // Thibault call is even attempted - so it shows up on the dashboard as
+    // "pending" immediately rather than only appearing once resolved.
+    const statusId = await recordPendingStatus({
+      shopifyOrderId: orderId,
+      orderNumber: order.name || order.order_number,
+      sku,
+    });
+
     try {
       const response = await submitThibaultOrder(payload);
       const simulated = Boolean(response && response.simulated);
@@ -146,12 +156,34 @@ async function processOrder({ res, order, orderId }) {
         simulated,
         thibaultOrderNumber: response && response.order_number,
       });
+      await markSent(statusId, { simulated });
       results.push({
         sku,
         status: 'success',
         simulated,
         thibaultOrderNumber: response && response.order_number,
       });
+
+      // Best-effort confirmation check against Thibault's own invoices
+      // endpoint (read-only GET) - Thibault is the source of truth, not our
+      // own send-success. Almost always "not found yet" immediately after
+      // submission (Thibault hasn't processed it yet) - that's expected and
+      // neutral, not an error; the dashboard's "Recheck confirmation"
+      // button re-runs this later. Never blocks order processing.
+      try {
+        const invoiceCheck = await checkThibaultInvoice(payload.customer_refs);
+        if (invoiceCheck.found) {
+          await markConfirmed(statusId, {
+            thibaultOrderNumber: invoiceCheck.orderNumber,
+            thibaultInvoiceNumber: invoiceCheck.invoiceNumber,
+          });
+        }
+      } catch (invoiceErr) {
+        console.error(
+          `[orders-create] Invoice confirmation check failed for order ${orderId} SKU ${sku}:`,
+          invoiceErr.message
+        );
+      }
     } catch (err) {
       logEvent({
         level: 'error',
@@ -169,6 +201,7 @@ async function processOrder({ res, order, orderId }) {
         thibaultError: err.message,
         thibaultResponse: err.response,
       });
+      await markFailed(statusId, err.message);
       results.push({ sku, status: 'error', error: err.message });
     }
   }

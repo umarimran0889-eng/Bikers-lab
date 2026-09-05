@@ -13,9 +13,12 @@
     "test:token-refresh": "node scripts/test-admin-token-refresh.js",
     "test:unresolved-item": "node scripts/test-unresolved-item.js",
     "test:alert": "node scripts/test-alert.js",
-    "test:alert-throttle": "node scripts/test-alert-throttle.js"
+    "test:alert-throttle": "node scripts/test-alert-throttle.js",
+    "test:dashboard": "node scripts/test-dashboard.js",
+    "test:confirmation-tracking": "node scripts/test-confirmation-tracking.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.115.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "resend": "^6.25.0"

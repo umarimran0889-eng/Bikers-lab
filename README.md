@@ -22,12 +22,14 @@ Order API, removing manual re-entry.
    keeps only the line items whose product carries the `Supplier-Thibault`
    tag.
 5. If none match, it skips cleanly with no action.
-6. Otherwise, it builds one Thibault order request per SKU and POSTs each to
-   `https://api.importationsthibault.com/api/v1/order` with a Bearer token
-   (`THIBAULT_API_TOKEN`).
+6. Otherwise, it builds one Thibault order request per SKU. For each one, it
+   writes a `pending` row to Supabase (see **Order status dashboard**), then
+   POSTs to `https://api.importationsthibault.com/api/v1/order` with a
+   Bearer token (`THIBAULT_API_TOKEN`), updating that row to `sent` or
+   `failed` once it resolves.
 7. Every outcome (success or failure per SKU) is logged to the console and to
-   `logs/forwarded-orders.log`. On failure, a stub alert function fires (real
-   email alerting isn't wired up yet — see **What's stubbed out**).
+   `logs/forwarded-orders.log`. On failure, a real alert email goes out via
+   Resend — see **Failure alerting**.
 
 ## Folder structure
 
@@ -45,12 +47,17 @@ lib/dedupeStore.js              File-based store to prevent double-forwarding
 lib/logger.js                   Structured console + file logging
 lib/unresolvedItemsLog.js       Separate log for line items whose tag lookup never succeeded
 lib/alerts.js                   Sends failure-alert emails via Resend (see "Failure alerting")
-scripts/dev-server.js           Local Express server for testing the handler
+lib/supabaseClient.js           Shared Supabase client (or null if unconfigured/mocked)
+lib/orderStatus.js              Writes/reads order_status rows (see "Order status dashboard")
+api/dashboard.js                Password-gated /dashboard page listing recent order_status rows
+scripts/dev-server.js           Local Express server for testing the handler + dashboard
 scripts/send-test-order.js      Signs & POSTs a sample order to the dev server
 scripts/test-admin-token-refresh.js  Tests token caching/expiry/refresh against a mocked fetch
 scripts/test-unresolved-item.js Tests retry + unresolved-item handling for a failed tag lookup
 scripts/test-alert.js           Exercises all 4 alert scenarios (real or mocked, see "Failure alerting")
 scripts/test-alert-throttle.js  Tests per-type alert throttling (5 rapid occurrences -> 1 send)
+scripts/test-dashboard.js       Verifies a webhook run writes pending->sent/failed rows to Supabase
+scripts/test-confirmation-tracking.js  Tests invoice/tracking response parsing + the Supabase round-trip
 fixtures/sample-order.json      Sample Shopify order payload for testing
 fixtures/sample-order-with-unresolved-item.json  Multi-item order with one always-failing lookup
 fixtures/product-tags.json      Stubbed product_id -> tags map used by the mock lookup
@@ -294,6 +301,128 @@ simulating the window elapsing (`expireThrottleWindow()`, a small
 test/ops-only escape hatch exported from `lib/alerts.js`), the next
 occurrence sends again and correctly reports "4 times" suppressed.
 
+## Order status dashboard
+
+A password-gated `/dashboard` page (`api/dashboard.js`) lists the ~100 most
+recent order-forwarding attempts, newest first, backed by a Supabase table:
+
+```sql
+create table order_status (
+  id bigint generated always as identity primary key,
+  shopify_order_id text not null,
+  order_number text,
+  sku text,
+  distributor text default 'thibault',
+  status text not null check (status in ('pending', 'sent', 'failed')),
+  error_message text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  -- Added for Thibault order confirmation + tracking:
+  thibault_order_number text,
+  thibault_invoice_number text,
+  confirmation text not null default 'not_confirmed'
+    check (confirmation in ('not_confirmed', 'confirmed')),
+  tracking_carrier text,
+  tracking_pin text,
+  tracking_shipped_at timestamptz
+);
+```
+
+**Writing status** (`lib/orderStatus.js`, wired into `api/webhooks/orders-create.js`):
+- As soon as a line item is confirmed Thibault-bound (before the Thibault
+  call is even attempted), a `pending` row is inserted.
+- Once the Thibault call resolves, that row is updated to `sent` (success)
+  or `failed` (with `error_message` populated from Thibault's error).
+- This happens **even when `THIBAULT_LIVE_CALLS_ENABLED` is off** - the row
+  is marked `sent`, with `error_message` noting it was simulated, so the
+  dashboard reflects that every local test run "worked" without ever
+  implying a real Thibault order was placed.
+- **Every Supabase call is wrapped in its own try/catch and never throws**
+  (`lib/supabaseClient.js` / `lib/orderStatus.js`) - a missing table, a bad
+  key, a network blip, none of it can break or block order forwarding. It's
+  logged and the webhook keeps going. (This was actually exercised for
+  real during development: the `order_status` table didn't exist yet in
+  Supabase on first test, and the webhook still completed normally.)
+
+**Reading status:** `lib/orderStatus.js`'s `listRecentStatuses()` powers the
+dashboard; `SUPABASE_MOCK=true` (or missing credentials) makes both reading
+and writing no-ops, logged clearly, so local testing that isn't about
+Supabase specifically doesn't have to touch it.
+
+### Order confirmation and tracking
+
+A row being `sent` only means *we* successfully called Thibault's Order API
+- it doesn't prove Thibault actually has the order. Confirmation and
+tracking use **Thibault's own API as the source of truth** instead:
+
+- **Confirmation** (`checkThibaultInvoice()` in `lib/thibaultClient.js`):
+  right after a successful send, a read-only `GET /api/v1/invoices?customer_refs={ref}`
+  call checks whether Thibault already has a matching invoice, using the
+  same `customer_refs` value sent in the order payload.
+  - **Found:** the row is marked `confirmation: confirmed`, and Thibault's
+    real `thibault_order_number` + `thibault_invoice_number` are saved.
+  - **Not found:** the row stays `not_confirmed` - this is expected and
+    neutral (Thibault usually hasn't processed the order yet), not an
+    error. It is never conflated with a failure.
+  - The dashboard's **"Recheck confirmation"** button (shown on any `sent`
+    row that isn't confirmed yet) re-runs this exact same check on demand.
+- **Tracking** (`getThibaultTracking()` in `lib/thibaultClient.js`): once
+  confirmed, `GET /api/v1/tracking?order={thibault_order_number}` fetches
+  carrier, tracking number, and ship date, shown in the Tracking column.
+  The **"Refresh tracking"** button re-runs this, since shipment status
+  changes over time.
+- **Entirely read-only** - both are GET requests against Thibault's API,
+  so there's zero risk of ever creating a duplicate order.
+- **Gated behind `THIBAULT_LIVE_CALLS_ENABLED`** exactly like
+  `submitThibaultOrder()` - while it's off, both checks return "not found"
+  immediately with no network call, since there's no real Thibault order to
+  check against yet.
+- Response shapes (`items[].document.{order,invoice}` and
+  `items[].shipment[].{pin,carrier,label_date}`) come directly from
+  Thibault's own `/docs` page for these two endpoints - not guessed.
+
+**Dashboard columns:** Order #, SKU, Status (`sent`/`failed`/`pending`),
+Thibault Confirmation (confirmed/not confirmed badge + the real Thibault
+order number once known, plus the Recheck button), Tracking (carrier +
+tracking number + ship date once available, plus the Refresh button),
+Timestamp, Error.
+
+**Viewing the dashboard locally:**
+```
+npm run dev
+```
+then visit `http://localhost:3000/dashboard` in a browser. You'll see a
+styled login form (not a browser popup) - enter `DASHBOARD_PASSWORD` from
+`.env`. A signed session cookie (12h) keeps you logged in after that; a
+"Sign out" link in the header clears it. Falls back to a stacked card
+layout on narrow (mobile) screens instead of a horizontally scrolling
+table.
+
+**Auth:** the login form posts to `/dashboard`, checked with a
+constant-time password comparison (same reasoning as the webhook's HMAC
+check) against `DASHBOARD_PASSWORD`. The session cookie is
+`HttpOnly`/`SameSite=Lax`, signed via HMAC using `DASHBOARD_PASSWORD` as
+the key - no separate secret or session store needed. If
+`DASHBOARD_PASSWORD` isn't set, the page denies access entirely (a clear
+"not configured" message) rather than showing a form that could never
+succeed.
+
+**Testing locally:**
+```
+npm run test:dashboard
+npm run test:confirmation-tracking
+```
+`test:dashboard` loads real `.env` credentials and verifies a webhook run
+writes `pending`→`sent` correctly (cleans up its own test rows afterward).
+`test:confirmation-tracking` has two parts: a hermetic mocked-`fetch` test
+proving `checkThibaultInvoice()`/`getThibaultTracking()` parse Thibault's
+documented response shape correctly (both the found and not-found cases),
+and a real-Supabase round-trip proving the new columns read/write
+correctly end-to-end. Neither touches Thibault's or Shopify's real APIs.
+Both require `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` to be set, and
+the `order_status` table (with the confirmation/tracking columns above) to
+actually exist - they'll say so clearly rather than silently passing.
+
 ## Environment variables
 
 Copy `.env.example` to `.env` and fill in:
@@ -312,6 +441,10 @@ Copy `.env.example` to `.env` and fill in:
 | `RESEND_API_KEY` | Yes (to actually send alert emails) | From your Resend account — see **Failure alerting** above |
 | `ALERT_EMAIL_TO` | Yes (to actually send alert emails) | Recipient address. Blank = alerts are logged, not sent |
 | `ALERT_EMAIL_FROM` | No | Defaults to Resend's sandbox address `onboarding@resend.dev` until a domain is verified |
+| `SUPABASE_URL` | Yes (for status tracking) | From your Supabase project's API settings — see **Order status dashboard** |
+| `SUPABASE_SERVICE_ROLE_KEY` | Yes (for status tracking) | Secret — from the same place. Never commit it |
+| `SUPABASE_MOCK` | No | `true` forces status reads/writes to no-op (logged), regardless of the above |
+| `DASHBOARD_PASSWORD` | Yes (to access `/dashboard`) | Shared password for the dashboard's HTTP Basic Auth gate |
 | `PORT` | No | Local dev server port (default `3000`) |
 
 ## Install
@@ -419,6 +552,16 @@ never silently dropped, never miscounted as "not Thibault."
 - Failure-alert emails via Resend for all four scenarios in **Failure
   alerting** above — real sending, not a stub, as long as `RESEND_API_KEY`
   and `ALERT_EMAIL_TO` are set
+- Order-status tracking to Supabase (`pending` → `sent`/`failed` per SKU)
+  and the password-gated `/dashboard` page (real login form + session
+  cookie, not the browser's Basic Auth popup) — real, not a stub, as long as
+  `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set **and** the
+  `order_status` table actually exists in that Supabase project (see
+  **Order status dashboard**)
+- Order confirmation + tracking against Thibault's own `/invoices` and
+  `/tracking` endpoints (read-only GETs, response shapes confirmed against
+  their docs) — real parsing/writing logic, gated the same way as
+  everything else behind `THIBAULT_LIVE_CALLS_ENABLED`
 
 **Stubbed / disabled by design:**
 - **Real Thibault API calls are off by default** — see **Thibault live

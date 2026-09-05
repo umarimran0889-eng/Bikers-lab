@@ -24,7 +24,7 @@ async function main() {
     orderName: '#1042',
     sku: 'TH-4521',
     orderPayload: {
-      item: { sku: 'TH-4521', qty: 2 },
+      item: [{ sku: 'TH-4521', qty: 2 }],
       ship_to: { contact: 'Alex Tremblay', city: 'Montreal', state: 'QC', zip: 'H2X 1Y6' },
       dropship: true,
     },
