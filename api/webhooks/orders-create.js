@@ -12,10 +12,26 @@ const {
   hasExistingStatusForOrder,
 } = require('../../lib/orderStatus');
 
-// Disables Vercel/Next's automatic body parsing so we can read the exact raw
-// bytes Shopify signed. Harmless locally; matters once this is deployed.
-const config = { api: { bodyParser: false } };
-
+// IMPORTANT (production requirement, not just local): HMAC verification
+// needs the exact raw bytes Shopify signed. On Vercel, plain Node.js
+// functions (this is not Next.js - the `config.api.bodyParser` convention
+// that used to be exported here is Next.js-only and does nothing here;
+// it has been removed since it was silently inert) auto-populate
+// `req.body` via a getter that parses - and thereby consumes - the raw
+// request stream for Content-Type: application/json, BEFORE any of our
+// code can read the original bytes ourselves. Once that happens, the raw
+// bytes are gone; there is no way to recover them or reliably reconstruct
+// Shopify's exact original serialization (key order/whitespace) from the
+// parsed object, so HMAC verification can never succeed against a
+// re-parsed body - not "sometimes fails", *never* succeeds.
+//
+// The fix is a required Vercel project Environment Variable:
+// NODEJS_HELPERS=0 (Project Settings -> Environment Variables, for every
+// environment this deploys to), which disables that auto-parsing so `req`
+// stays the raw, unconsumed stream and our own readRawBody() below gets
+// the genuine bytes - exactly like local dev (where nothing pre-parses
+// the request) and exactly like scripts/test-raw-webhook-body.js, which
+// exercises this real stream-reading path end-to-end.
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -42,6 +58,22 @@ async function ordersCreateHandler(req, res) {
     rawBody = req.body;
   } else if (typeof req.body === 'string') {
     rawBody = Buffer.from(req.body);
+  } else if (req.body !== undefined) {
+    // req.body is already a parsed object - Vercel's Node.js helpers ran
+    // and consumed the raw stream before we got to it (see the note
+    // above). The genuine bytes are unrecoverable at this point, so HMAC
+    // verification against anything derived from this object would always
+    // fail. Fail loudly and specifically here instead, so this shows up as
+    // an actionable, named misconfiguration rather than a confusing
+    // generic "HMAC verification failed".
+    logEvent({
+      level: 'error',
+      message:
+        'req.body was already parsed (Vercel Node.js helpers are active) - the raw request body is ' +
+        'unavailable, so HMAC verification cannot run. Set NODEJS_HELPERS=0 in this environment\'s Vercel ' +
+        'project settings.',
+    });
+    return sendJson(res, 500, { error: 'Server misconfigured: raw request body unavailable' });
   } else {
     rawBody = await readRawBody(req);
   }
@@ -228,4 +260,3 @@ async function processOrder({ res, order, orderId }) {
 }
 
 module.exports = ordersCreateHandler;
-module.exports.config = config;

@@ -61,6 +61,7 @@ scripts/test-alert-throttle.js  Tests per-type alert throttling (5 rapid occurre
 scripts/test-dashboard.js       Verifies a webhook run writes pending->sent/failed rows to Supabase
 scripts/test-confirmation-tracking.js  Tests invoice/tracking response parsing + the Supabase round-trip
 scripts/test-readonly-fs.js     Simulates Vercel's read-only filesystem locally (see "No filesystem writes")
+scripts/test-raw-webhook-body.js  Tests the real raw-stream HMAC path (see "Raw webhook body & NODEJS_HELPERS")
 fixtures/sample-order.json      Sample Shopify order payload for testing
 fixtures/sample-order-with-unresolved-item.json  Multi-item order with one always-failing lookup
 fixtures/product-tags.json      Stubbed product_id -> tags map used by the mock lookup
@@ -125,6 +126,61 @@ delivery through and asserts both that the handler completes successfully
 temp. This is as close to proving the fix as local tooling can get; it is
 not a substitute for confirming on a real deployment, which needs an actual
 Vercel environment to fully verify (see below).
+
+## Raw webhook body & `NODEJS_HELPERS` (required Vercel setting)
+
+**HMAC verification needs the exact raw bytes Shopify signed - and getting
+those bytes on Vercel requires a specific, easy-to-miss project setting.**
+This caused a second production incident right after the filesystem fix
+above: real Shopify deliveries (confirmed via their `Shopify-Captain-Hook`
+User-Agent) started failing HMAC verification on every single request.
+
+**Root cause:** Vercel's Node.js Serverless Functions (the plain kind under
+`api/` used here - not Next.js) auto-populate `req.body` with a *parsed*
+version of the request whenever `Content-Type: application/json` is sent -
+accessing `req.body` at all triggers a getter that reads and consumes the
+raw request stream to produce that parsed object. Once that happens, the
+original bytes are gone; there's no reconstructing Shopify's exact
+serialization (key order, whitespace) from the parsed object, so HMAC
+verification can never succeed against it - not "sometimes fails", *never*
+succeeds. The `config.api.bodyParser = false` export that used to be in
+`api/webhooks/orders-create.js` did nothing here - that convention only
+applies to Next.js API routes, and this project isn't Next.js. It's been
+removed since it was actively misleading.
+
+**The fix - a required Vercel project Environment Variable:**
+```
+NODEJS_HELPERS=0
+```
+Set in the Vercel dashboard (Project Settings → Environment Variables) for
+every environment this deploys to (Production, and Preview if you test
+there too), then redeploy. This disables Vercel's automatic
+`req.body`/`req.query`/`req.cookies` parsing entirely, so `req` stays the
+raw, unconsumed stream and `readRawBody()` in `api/webhooks/orders-create.js`
+gets the genuine bytes - exactly like local dev, where nothing pre-parses
+the request. (`api/dashboard.js` already parsed cookies/query/body itself
+manually rather than relying on these helpers, so disabling them doesn't
+affect it.) This is a platform-level setting, not an application env var -
+it isn't read via `process.env` anywhere in this codebase, and has no
+effect locally.
+
+**Defense in depth:** if `req.body` ever shows up already parsed anyway
+(e.g. `NODEJS_HELPERS` isn't set in some environment), the handler now
+detects this specifically and fails with a clear, actionable 500
+("Server misconfigured: raw request body unavailable") naming the exact
+fix - instead of the confusing generic "HMAC verification failed" that
+made this hard to diagnose the first time.
+
+**Why no existing test caught this:** every other test script builds its
+fake `req` with `body` already set to a `Buffer` - which takes a shortcut
+straight past the raw-stream-reading code, so `readRawBody()` was never
+actually exercised by any of them. `npm run test:raw-webhook-body` fixes
+that: it builds a real Node.js `Readable` stream (no pre-set `body`, bytes
+only obtainable via `req.on('data'/'end')`, exactly like a genuine HTTP
+request) with a correctly-computed signature, confirms it verifies and
+processes successfully, and separately confirms the "helpers still active"
+misconfiguration is caught with the clear, named error above rather than
+silently mis-verifying.
 
 ## Line item matching
 
@@ -489,6 +545,13 @@ actually exist - they'll say so clearly rather than silently passing.
 ## Environment variables
 
 Copy `.env.example` to `.env` and fill in:
+
+> **Also required on Vercel, but not an app env var:** `NODEJS_HELPERS=0`
+> must be set in the Vercel project's Environment Variables (not `.env` -
+> it's a platform setting, has no effect locally, and isn't read via
+> `process.env` anywhere in this code). See **Raw webhook body &
+> NODEJS_HELPERS** above - without it, HMAC verification fails on every
+> real webhook delivery.
 
 | Variable | Required | Description |
 |---|---|---|

@@ -16,7 +16,8 @@
     "test:alert-throttle": "node scripts/test-alert-throttle.js",
     "test:dashboard": "node scripts/test-dashboard.js",
     "test:confirmation-tracking": "node scripts/test-confirmation-tracking.js",
-    "test:readonly-fs": "node scripts/test-readonly-fs.js"
+    "test:readonly-fs": "node scripts/test-readonly-fs.js",
+    "test:raw-webhook-body": "node scripts/test-raw-webhook-body.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.115.0",
