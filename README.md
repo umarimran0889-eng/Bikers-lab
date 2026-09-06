@@ -15,8 +15,9 @@ Order API, removing manual re-entry.
    `X-Shopify-Hmac-Sha256` header against an HMAC-SHA256 computed over the
    raw request body, using `SHOPIFY_WEBHOOK_SECRET` (constant-time
    comparison, not a plain string equality check).
-3. It checks a local dedupe store — if this Shopify order ID has already been
-   processed (Shopify retries webhooks on timeout), it skips silently.
+3. It checks Supabase for an existing `order_status` row for this Shopify
+   order ID — if this order was already processed (Shopify retries webhooks
+   on timeout), it skips silently.
 4. For each distinct product on the order, it looks up that product's tags
    via the Shopify Admin API (cached — see **Line item matching** below) and
    keeps only the line items whose product carries the `Supplier-Thibault`
@@ -27,9 +28,11 @@ Order API, removing manual re-entry.
    POSTs to `https://api.importationsthibault.com/api/v1/order` with a
    Bearer token (`THIBAULT_API_TOKEN`), updating that row to `sent` or
    `failed` once it resolves.
-7. Every outcome (success or failure per SKU) is logged to the console and to
-   `logs/forwarded-orders.log`. On failure, a real alert email goes out via
-   Resend — see **Failure alerting**.
+7. Every outcome (success or failure per SKU) is logged to the console
+   (captured by Vercel's own Logs dashboard in production — nothing is
+   written to disk anywhere in this project, see **No filesystem writes**
+   below). On failure, a real alert email goes out via Resend — see
+   **Failure alerting**.
 
 ## Folder structure
 
@@ -38,14 +41,13 @@ api/webhooks/orders-create.js   Main webhook handler (entry point)
 lib/verifyWebhook.js            Shopify HMAC signature verification
 lib/mapOrderToThibault.js       Tag-based line item filtering + Thibault payload building
 lib/productTags.js              Product tag lookup orchestrator (cache, retries, mock/live switch)
-lib/productTagCache.js          Short-lived file-based cache of product_id -> tags
+lib/productTagCache.js          Short-lived in-memory cache of product_id -> tags
 lib/shopifyAdminClient.js       Real Shopify Admin API product tag lookup
 lib/shopifyAdminAuth.js         OAuth token manager - fetches/caches/refreshes the Admin API access token
 lib/shopifyAdminMock.js         Stubbed product tag lookup for local testing
 lib/thibaultClient.js           POSTs (or simulates) an order to Thibault's Order API
-lib/dedupeStore.js              File-based store to prevent double-forwarding
-lib/logger.js                   Structured console + file logging
-lib/unresolvedItemsLog.js       Separate log for line items whose tag lookup never succeeded
+lib/logger.js                   Structured console logging (console.log only, no files)
+lib/unresolvedItemsLog.js       Separate console.warn logging for line items whose tag lookup never succeeded
 lib/alerts.js                   Sends failure-alert emails via Resend (see "Failure alerting")
 lib/supabaseClient.js           Shared Supabase client (or null if unconfigured/mocked)
 lib/orderStatus.js              Writes/reads order_status rows (see "Order status dashboard")
@@ -58,12 +60,71 @@ scripts/test-alert.js           Exercises all 4 alert scenarios (real or mocked,
 scripts/test-alert-throttle.js  Tests per-type alert throttling (5 rapid occurrences -> 1 send)
 scripts/test-dashboard.js       Verifies a webhook run writes pending->sent/failed rows to Supabase
 scripts/test-confirmation-tracking.js  Tests invoice/tracking response parsing + the Supabase round-trip
+scripts/test-readonly-fs.js     Simulates Vercel's read-only filesystem locally (see "No filesystem writes")
 fixtures/sample-order.json      Sample Shopify order payload for testing
 fixtures/sample-order-with-unresolved-item.json  Multi-item order with one always-failing lookup
 fixtures/product-tags.json      Stubbed product_id -> tags map used by the mock lookup
-data/                           Dedupe store + tag cache (gitignored, created on first run)
-logs/                           Forwarded-order + unresolved-item logs (gitignored, created on first run)
 ```
+
+No `data/` or `logs/` directories - see **No filesystem writes** below.
+
+## No filesystem writes
+
+**Nothing in this project writes to disk, anywhere, ever - by design, not by
+accident.** This wasn't always true, and the fallout was a real production
+incident worth documenting so it doesn't get reintroduced:
+
+Early versions had four things writing to project-relative `data/`/`logs/`
+folders: a duplicate-order dedupe store, a product-tag cache, and two log
+files. All four worked perfectly in local dev, because a normal filesystem
+is fully writable - which is exactly what hid the problem. Once deployed,
+Vercel's serverless functions run on a filesystem that's **read-only
+everywhere except `/tmp`** (and `/tmp` itself is ephemeral and not shared
+across invocations or instances). The very first real webhook delivery
+crashed with `ENOENT: no such file or directory, mkdir '/var/task/logs'` -
+a 500 on every single order, meaning nothing reached Thibault, Supabase, or
+anywhere else, since the crash happened before any of that logic ran.
+
+The fix, applied throughout:
+- **`lib/logger.js` / `lib/unresolvedItemsLog.js`** - `console.log`/
+  `console.warn` only, no file writes. Vercel captures stdout/stderr into
+  its own Logs dashboard automatically - that's the right place for this
+  anyway, not a project-relative file only the same server instance could
+  ever read back.
+- **`lib/productTagCache.js`** - now a plain in-memory `Map`, not a file.
+  Purely a performance optimization (skip a redundant Shopify Admin API
+  call within the same warm instance) - resetting per cold start / per
+  instance is a fully acceptable trade-off, unlike correctness-critical
+  state.
+- **Duplicate-order protection** - now backed by Supabase instead of a
+  local file (see `hasExistingStatusForOrder()` in `lib/orderStatus.js`,
+  used in `api/webhooks/orders-create.js`): checks whether an
+  `order_status` row already exists for this Shopify order ID. This is
+  more correct anyway, not just "not broken" - a project-relative file
+  never actually persisted across separate serverless invocations even
+  before this crash, so duplicate-order protection likely never really
+  worked in production; a shared database naturally does. One trade-off:
+  this fails *open* (treats "can't tell" as "not yet processed") if
+  Supabase itself is unavailable at that exact moment, since failing
+  *closed* would risk silently dropping real new orders instead - the same
+  "never let a dependency block order processing" principle used
+  everywhere else in this project. Also note: only orders with at least
+  one Thibault-matched SKU get an `order_status` row at all, so an order
+  with zero Thibault items won't be recognized as a duplicate on retry -
+  harmless (nothing was ever going to be forwarded for it anyway), just a
+  little redundant tag-lookup work.
+
+**Testing this locally** (`npm run test:readonly-fs`): local dev's
+filesystem is fully writable, which is exactly what let this bug hide until
+a real deployment found it - so this test doesn't just run the code
+locally, it simulates Vercel's actual constraint by intercepting every
+`fs` write/mkdir call and throwing the same `ENOENT` error Vercel did for
+anything outside the OS temp directory. It then runs a real webhook
+delivery through and asserts both that the handler completes successfully
+(200, not a crash) and that literally zero write attempts occurred outside
+temp. This is as close to proving the fix as local tooling can get; it is
+not a substitute for confirming on a real deployment, which needs an actual
+Vercel environment to fully verify (see below).
 
 ## Line item matching
 
@@ -95,8 +156,9 @@ webhook receives order
 Lookups run **sequentially, not in parallel** (`lib/productTags.js`), with a
 ~550ms pause after each real Admin API call, to stay within Shopify's
 standard Admin REST API rate limit (roughly 2 requests/second per store).
-Results are cached in `data/product-tag-cache.json` for 1 hour, so
-frequently-ordered products don't trigger a repeat lookup. Failed lookups
+Results are cached in memory for 1 hour (per warm instance - see **No
+filesystem writes**), so frequently-ordered products don't trigger a repeat
+lookup. Failed lookups
 are never cached, since a transient failure must not get "stuck" as a
 false answer for an hour.
 
@@ -121,10 +183,11 @@ never take down the rest of the order with it.
   excluded, regardless of whether some other item in the same order came
   back unresolved.
 - **Unresolved items are logged separately** from normal success/failure
-  logs, to `logs/unresolved-items.log` (`lib/unresolvedItemsLog.js`) — one
-  JSON line per item with the order id/name, `product_id`, SKU, line item
-  id, and the underlying error — so they're easy to find and manually
-  review, rather than mixed in with routine forwarding logs.
+  logs, via a distinct `[unresolved-item]`-prefixed `console.warn`
+  (`lib/unresolvedItemsLog.js`) — one JSON line per item with the order
+  id/name, `product_id`, SKU, line item id, and the underlying error — so
+  they're easy to find (search Vercel's Logs dashboard for the prefix) and
+  manually review, rather than mixed in with routine forwarding logs.
 - **Each unresolved item also triggers the same stubbed failure-alert**
   (`lib/alerts.js`) used for Thibault API rejections — it's exactly the
   kind of thing that needs a human to check, since the system genuinely
@@ -473,11 +536,12 @@ Requires Node.js 18+ (uses the built-in `fetch`).
    npm run test:order
    ```
    Or point it at a different fixture: `node scripts/send-test-order.js path/to/order.json`.
-4. Watch the dev server terminal for structured log lines, and check
-   `logs/forwarded-orders.log` / `data/processed-orders.json` /
-   `data/product-tag-cache.json` afterwards.
+4. Watch the dev server terminal for structured log lines (console only -
+   see **No filesystem writes**).
 5. Run `npm run test:order` again with the same fixture to see duplicate
-   protection kick in (`{"status":"skipped","reason":"duplicate"}`).
+   protection kick in (`{"status":"skipped","reason":"duplicate"}`) - this
+   now requires `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` to be set, since
+   it's backed by the `order_status` table rather than a local file.
 
 The sample fixture (`fixtures/sample-order.json`) contains two Thibault line
 items (different SKUs, to exercise the one-call-per-SKU logic, and their
@@ -529,9 +593,9 @@ mocked tag lookup always fails) straight through the real webhook handler,
 and asserts: exactly 2 retries happen for the failing product before it's
 given up on; the confirmed-Thibault item still gets forwarded (via the
 simulated path) despite the other item failing; the confirmed-non-Thibault
-item is still correctly excluded; and the failed item lands in
-`logs/unresolved-items.log` with the right order/product/SKU details -
-never silently dropped, never miscounted as "not Thibault."
+item is still correctly excluded; and the failed item is logged via
+`console.warn` with the right order/product/SKU details - never silently
+dropped, never miscounted as "not Thibault."
 
 ## What's stubbed out vs. working
 
@@ -539,16 +603,17 @@ never silently dropped, never miscounted as "not Thibault."
 - HMAC webhook verification (constant-time comparison)
 - `Supplier-Thibault` tag-based line item filtering, via a real (or mocked)
   Shopify Admin API lookup — case-insensitive, whitespace-trimmed
-- Sequential, rate-limit-aware product tag lookups with a 1-hour local cache,
-  retried on failure, with unresolved items tracked separately rather than
-  dropped or misclassified (see **Retries and unresolved items**)
+- Sequential, rate-limit-aware product tag lookups with a 1-hour in-memory
+  cache, retried on failure, with unresolved items tracked separately
+  rather than dropped or misclassified (see **Retries and unresolved items**)
 - OAuth `client_credentials` token fetching, in-memory caching, and
   expiry-aware auto-refresh for the Shopify Admin API (`lib/shopifyAdminAuth.js`)
 - Order → Thibault payload mapping (per the documented Order endpoint schema)
 - One simulated (or, once enabled, real) call per SKU against the Thibault
   Order endpoint shape
-- File-based duplicate-order protection
-- Structured logging to console + file
+- Supabase-backed duplicate-order protection (see **No filesystem writes**)
+- Structured logging to console only - nothing written to disk anywhere in
+  this project (see **No filesystem writes**)
 - Failure-alert emails via Resend for all four scenarios in **Failure
   alerting** above — real sending, not a stub, as long as `RESEND_API_KEY`
   and `ALERT_EMAIL_TO` are set
@@ -574,8 +639,7 @@ never silently dropped, never miscounted as "not Thibault."
   separate enable flag for this one, since reading product tags is
   low-risk. `THIBAULT_LIVE_CALLS_ENABLED` is the only gate that matters for
   actually contacting the supplier.)
-- Dedupe store and tag cache are local JSON files — fine for local dev, not
-  safe for a multi-instance production deployment.
-- No live Shopify store or Vercel connection yet — this is local-only for
-  now. Deployment (Vercel env vars, registering the real webhook, etc.) is a
-  separate future step.
+- Deployed on Vercel — `api/*.js` handlers, plus `vercel.json` rewriting the
+  clean `/dashboard` URL to `/api/dashboard` (Vercel's default file-based
+  route). See **No filesystem writes** above for the read-only-filesystem
+  constraints that come with running here.

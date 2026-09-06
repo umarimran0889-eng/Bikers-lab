@@ -1,11 +1,16 @@
 const { verifyShopifyWebhook } = require('../../lib/verifyWebhook');
 const { getThibaultLineItems, buildThibaultOrderPayloads } = require('../../lib/mapOrderToThibault');
 const { submitThibaultOrder, checkThibaultInvoice } = require('../../lib/thibaultClient');
-const { hasBeenProcessed, markProcessed } = require('../../lib/dedupeStore');
 const { logEvent } = require('../../lib/logger');
 const { logUnresolvedItem } = require('../../lib/unresolvedItemsLog');
 const { sendFailureAlert } = require('../../lib/alerts');
-const { recordPendingStatus, markSent, markFailed, markConfirmed } = require('../../lib/orderStatus');
+const {
+  recordPendingStatus,
+  markSent,
+  markFailed,
+  markConfirmed,
+  hasExistingStatusForOrder,
+} = require('../../lib/orderStatus');
 
 // Disables Vercel/Next's automatic body parsing so we can read the exact raw
 // bytes Shopify signed. Harmless locally; matters once this is deployed.
@@ -85,7 +90,15 @@ async function ordersCreateHandler(req, res) {
 }
 
 async function processOrder({ res, order, orderId }) {
-  if (hasBeenProcessed(orderId)) {
+  // Duplicate-order check: is there already an order_status row for this
+  // Shopify order (Shopify retries webhooks on timeout)? Backed by
+  // Supabase, not a local file - a file can never persist reliably across
+  // serverless invocations/instances. Only orders with at least one
+  // Thibault-matched SKU get a row in the first place, so an order with no
+  // Thibault items will redundantly re-check tags on a retry rather than
+  // short-circuit here - harmless (no duplicate Thibault submission risk),
+  // just a little wasted work.
+  if (await hasExistingStatusForOrder(orderId)) {
     logEvent({ level: 'info', orderId, message: 'Duplicate webhook delivery, already processed - skipping' });
     return sendJson(res, 200, { status: 'skipped', reason: 'duplicate' });
   }
@@ -205,8 +218,6 @@ async function processOrder({ res, order, orderId }) {
       results.push({ sku, status: 'error', error: err.message });
     }
   }
-
-  markProcessed(orderId, { results, unresolvedCount: unresolvedItems.length });
 
   const anyFailed = results.some((r) => r.status === 'error');
   return sendJson(res, anyFailed ? 207 : 200, {

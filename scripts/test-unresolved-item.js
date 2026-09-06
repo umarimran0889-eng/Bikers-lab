@@ -3,14 +3,15 @@
 //   - the other line items in that order still process normally
 //     (the confirmed-Thibault item gets forwarded, the confirmed-non-Thibault
 //     item is correctly excluded)
-//   - the failed item is logged to logs/unresolved-items.log, not dropped
-//     and not treated as "confirmed not Thibault"
+//   - the failed item is logged via console.warn (`[unresolved-item]`), not
+//     dropped and not treated as "confirmed not Thibault"
 //   - retries actually happened (2 retries, ~300ms apart) before giving up
 //
 // Run with: node scripts/test-unresolved-item.js
 // Uses the mock Shopify Admin client (forced, regardless of .env) and the
 // simulated Thibault path (THIBAULT_LIVE_CALLS_ENABLED forced off) - no
-// real network calls of any kind.
+// real network calls of any kind. Also doesn't load .env, so Supabase
+// status writes are skipped entirely (logged, not attempted).
 
 const crypto = require('crypto');
 const path = require('path');
@@ -20,17 +21,16 @@ process.env.SHOPIFY_ADMIN_MOCK = 'true';
 process.env.THIBAULT_LIVE_CALLS_ENABLED = 'false';
 process.env.SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || 'test-secret-for-unresolved-item-test';
 
-const CACHE_FILE = path.join(__dirname, '..', 'data', 'product-tag-cache.json');
-const UNRESOLVED_LOG_FILE = path.join(__dirname, '..', 'logs', 'unresolved-items.log');
-if (fs.existsSync(CACHE_FILE)) fs.unlinkSync(CACHE_FILE);
-if (fs.existsSync(UNRESOLVED_LOG_FILE)) fs.unlinkSync(UNRESOLVED_LOG_FILE);
-
 const retryWarnings = [];
+let unresolvedItemLogLine = null;
 const realWarn = console.warn;
 console.warn = (...args) => {
   const msg = args.join(' ');
   if (msg.includes('[product-tags]') && msg.includes('7005550001')) {
     retryWarnings.push(msg);
+  }
+  if (msg.startsWith('[unresolved-item] ')) {
+    unresolvedItemLogLine = msg.slice('[unresolved-item] '.length);
   }
   realWarn(...args);
 };
@@ -92,12 +92,9 @@ async function main() {
     `exactly 2 retry warnings were logged for the unresolvable product before giving up (got ${retryWarnings.length})`
   );
 
-  const unresolvedLogContent = fs.existsSync(UNRESOLVED_LOG_FILE)
-    ? fs.readFileSync(UNRESOLVED_LOG_FILE, 'utf8').trim()
-    : '';
-  assert(unresolvedLogContent.length > 0, 'logs/unresolved-items.log received an entry');
+  assert(unresolvedItemLogLine !== null, 'a "[unresolved-item]" console.warn line was emitted');
 
-  const unresolvedEntry = unresolvedLogContent ? JSON.parse(unresolvedLogContent.split('\n')[0]) : {};
+  const unresolvedEntry = unresolvedItemLogLine ? JSON.parse(unresolvedItemLogLine) : {};
   assert(
     unresolvedEntry.sku === 'TH-UNRESOLVED-1',
     `unresolved log entry is for SKU TH-UNRESOLVED-1, not dropped and not silently excluded (got ${unresolvedEntry.sku})`
