@@ -563,7 +563,10 @@ async function handleRecheckConfirmation(params, res) {
         }
       }
     } catch (err) {
-      console.error(`[dashboard] Recheck confirmation failed for row ${id}:`, err.message);
+      console.error(`[dashboard] Recheck confirmation failed for row ${id}:`, err.message, {
+        status: err.status,
+        response: err.response,
+      });
     }
   }
   return redirectToDashboard(res);
