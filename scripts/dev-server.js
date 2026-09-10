@@ -34,8 +34,13 @@ function handleDashboard(req, res) {
 app.get('/dashboard', handleDashboard);
 app.post('/dashboard', handleDashboard);
 
+// Mirrors the "/" -> "/dashboard" redirect in vercel.json - Vercel's
+// redirects/rewrites config has no effect on this local Express server, so
+// this route exists purely to make local testing match production
+// behavior. permanent: false there = a 307 here (temporary redirect);
+// Vercel's docs: permanent true -> 308, false -> 307.
 app.get('/', (_req, res) => {
-  res.send('Biker Lab Thibault order forwarder - local dev server is running. See /dashboard for order status.');
+  res.redirect(307, '/dashboard');
 });
 
 app.listen(PORT, () => {
