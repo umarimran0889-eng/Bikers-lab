@@ -2,7 +2,7 @@
   "name": "biker-lab-thibault-forwarder",
   "version": "0.1.0",
   "private": true,
-  "description": "Forwards Shopify orders containing Supplier-Thibault-tagged line items to Importations Thibault's Order API.",
+  "description": "Forwards Shopify orders containing Supplier-Thibault or Supplier-Kimpex tagged line items to Importations Thibault's Order API and a Kimpex Excel export.",
   "main": "api/webhooks/orders-create.js",
   "engines": {
     "node": ">=18"
@@ -17,11 +17,15 @@
     "test:dashboard": "node scripts/test-dashboard.js",
     "test:confirmation-tracking": "node scripts/test-confirmation-tracking.js",
     "test:readonly-fs": "node scripts/test-readonly-fs.js",
-    "test:raw-webhook-body": "node scripts/test-raw-webhook-body.js"
+    "test:raw-webhook-body": "node scripts/test-raw-webhook-body.js",
+    "test:shipto-mississauga": "node scripts/test-shipto-mississauga.js",
+    "test:kimpex-order": "node scripts/test-kimpex-order.js",
+    "test:kimpex-export": "node scripts/test-kimpex-export.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.115.0",
     "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
     "express": "^4.19.2",
     "resend": "^6.25.0"
   }

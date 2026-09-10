@@ -1,6 +1,8 @@
 const crypto = require('crypto');
 const { listRecentStatuses, getStatusById, markConfirmed, updateTracking } = require('../lib/orderStatus');
 const { checkThibaultInvoice, getThibaultTracking } = require('../lib/thibaultClient');
+const { listRecentKimpexOrders, listPendingKimpexOrders, markKimpexOrdersExported } = require('../lib/kimpexOrders');
+const { buildKimpexExportWorkbook } = require('../lib/kimpexExport');
 
 const ROW_LIMIT = 100;
 const SESSION_COOKIE_NAME = 'thibault_dashboard_session';
@@ -143,7 +145,7 @@ function renderLoginPage({ error } = {}) {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Thibault Dashboard - Sign in</title>
+<title>Order Status Dashboard - Sign in</title>
 <style>
 ${BASE_STYLE}
   .login-wrap {
@@ -210,7 +212,7 @@ ${BASE_STYLE}
 <body>
   <div class="login-wrap">
     <div class="login-card">
-      <h1>Thibault Order Status</h1>
+      <h1>Order Status Dashboard</h1>
       <p class="subtitle">Enter the dashboard password to continue.</p>
       ${error ? '<div class="error">Incorrect password. Try again.</div>' : ''}
       <form method="POST" action="/dashboard">
@@ -230,7 +232,7 @@ function renderMisconfiguredPage() {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Thibault Dashboard</title>
+<title>Order Status Dashboard</title>
 <style>${BASE_STYLE}
   .notice-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
   .notice { max-width: 420px; text-align: center; color: #6b7280; }
@@ -294,20 +296,70 @@ function renderRow(row) {
         </tr>`;
 }
 
-function renderDashboardPage(rows) {
+function renderKimpexRow(row) {
+  const exported = Boolean(row.exported);
+  return `        <tr>
+          <td data-label="Order #">${escapeHtml(row.order_number)}</td>
+          <td data-label="SKU">${escapeHtml(row.sku)}</td>
+          <td data-label="Status"><span class="badge ${exported ? 'badge-sent' : 'badge-pending'}">${
+    exported ? 'Exported' : 'Pending'
+  }</span></td>
+          <td data-label="Timestamp">${escapeHtml(formatTimestamp(row.created_at))}</td>
+        </tr>`;
+}
+
+function renderDashboardPage(rows, kimpexRows) {
   const rowsHtml = rows.length
     ? rows.map(renderRow).join('\n')
     : `        <tr><td colspan="7" class="empty">No orders recorded yet.</td></tr>`;
+
+  const kimpexRowsHtml = kimpexRows.length
+    ? kimpexRows.map(renderKimpexRow).join('\n')
+    : `        <tr><td colspan="4" class="empty">No Kimpex orders recorded yet.</td></tr>`;
+
+  const kimpexPendingCount = kimpexRows.filter((r) => !r.exported).length;
 
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Thibault Order Status</title>
+<title>Order Status Dashboard</title>
 <style>
 ${BASE_STYLE}
   main { padding: 16px; max-width: 1100px; margin: 0 auto; }
+  section { margin-bottom: 32px; }
+  section:last-child { margin-bottom: 0; }
+  section h2 {
+    font-size: 1rem;
+    margin: 0 0 4px;
+    color: #111827;
+  }
+  section .section-sub {
+    margin: 0 0 12px;
+    color: #6b7280;
+    font-size: 0.85rem;
+  }
+  .section-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .btn-primary {
+    padding: 8px 14px;
+    border: none;
+    border-radius: 8px;
+    background: #111827;
+    color: #fff;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn-primary:hover { background: #1f2937; }
+  .btn-primary:disabled { background: #9ca3af; cursor: not-allowed; }
   .table-wrap {
     overflow-x: auto;
     background: #fff;
@@ -396,32 +448,69 @@ ${BASE_STYLE}
 <body>
   <header>
     <div>
-      <h1>Thibault Order Status</h1>
-      <p>Most recent ${rows.length} order${rows.length === 1 ? '' : 's'} forwarded to Thibault</p>
+      <h1>Order Status Dashboard</h1>
+      <p>Biker Lab &middot; Thibault + Kimpex order forwarding</p>
     </div>
     <a class="logout" href="/dashboard?logout=1">Sign out</a>
   </header>
   <main>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Order #</th>
-            <th>SKU</th>
-            <th>Status</th>
-            <th>Thibault Confirmation</th>
-            <th>Tracking</th>
-            <th>Timestamp</th>
-            <th>Error</th>
-          </tr>
-        </thead>
-        <tbody>
+    <section>
+      <h2>Thibault Orders</h2>
+      <p class="section-sub">Most recent ${rows.length} order${rows.length === 1 ? '' : 's'} forwarded to Thibault's Order API</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Order #</th>
+              <th>SKU</th>
+              <th>Status</th>
+              <th>Thibault Confirmation</th>
+              <th>Tracking</th>
+              <th>Timestamp</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>
 ${rowsHtml}
-        </tbody>
-      </table>
-    </div>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-header">
+        <div>
+          <h2>Kimpex Orders</h2>
+          <p class="section-sub">
+            ${kimpexPendingCount} pending, ${kimpexRows.length - kimpexPendingCount} already exported
+            (most recent ${kimpexRows.length} shown) - Kimpex has no API, orders go out via manual Excel upload
+          </p>
+        </div>
+        <form method="POST" action="/dashboard">
+          <input type="hidden" name="action" value="kimpex_export" />
+          <button type="submit" class="btn-primary"${kimpexPendingCount === 0 ? ' disabled' : ''}>
+            Download Kimpex Export${kimpexPendingCount > 0 ? ` (${kimpexPendingCount})` : ''}
+          </button>
+        </form>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Order #</th>
+              <th>SKU</th>
+              <th>Status</th>
+              <th>Timestamp</th>
+            </tr>
+          </thead>
+          <tbody>
+${kimpexRowsHtml}
+          </tbody>
+        </table>
+      </div>
+    </section>
   </main>
-  <footer>Biker Lab &middot; Thibault order forwarder</footer>
+  <footer>Biker Lab &middot; Order forwarder</footer>
 </body>
 </html>`;
 }
@@ -524,10 +613,37 @@ async function handlePost(req, res) {
 
   if (action === 'recheck_confirmation') return handleRecheckConfirmation(params, res);
   if (action === 'refresh_tracking') return handleRefreshTracking(params, res);
+  if (action === 'kimpex_export') return handleKimpexExport(res);
 
   res.statusCode = 400;
   res.setHeader('Content-Type', 'text/plain');
   return res.end('Unknown action');
+}
+
+/**
+ * Generates the Kimpex "Orders" upload .xlsx from every pending (not yet
+ * exported) row, streams it back as a download, then marks exactly those
+ * rows exported: true. Rows are never deleted - kept as a record of what
+ * was sent, per the requirement that this be an audit trail, not a queue.
+ *
+ * If there's nothing pending, redirects back rather than downloading a
+ * pointless empty file (the button is also disabled client-side in that
+ * case, but this covers a direct POST too).
+ */
+async function handleKimpexExport(res) {
+  const pendingRows = await listPendingKimpexOrders();
+  if (pendingRows.length === 0) {
+    return redirectToDashboard(res);
+  }
+
+  const buffer = await buildKimpexExportWorkbook(pendingRows);
+  await markKimpexOrdersExported(pendingRows.map((r) => r.id));
+
+  const filename = `kimpex-export-${new Date().toISOString().slice(0, 10)}.xlsx`;
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  return res.end(buffer);
 }
 
 async function handleView(req, res) {
@@ -544,8 +660,8 @@ async function handleView(req, res) {
     return sendHtml(res, 200, renderLoginPage());
   }
 
-  const rows = await listRecentStatuses(ROW_LIMIT);
-  return sendHtml(res, 200, renderDashboardPage(rows));
+  const [rows, kimpexRows] = await Promise.all([listRecentStatuses(ROW_LIMIT), listRecentKimpexOrders(ROW_LIMIT)]);
+  return sendHtml(res, 200, renderDashboardPage(rows, kimpexRows));
 }
 
 /**

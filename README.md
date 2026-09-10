@@ -5,8 +5,9 @@ drop-ships orders directly to customers but does not accept order
 notifications by email — orders must go through their REST API instead.
 
 This project listens for Shopify's `orders/create` webhook and automatically
-forwards any order containing Thibault-supplied line items to Thibault's
-Order API, removing manual re-entry.
+routes any order containing tagged line items to the right supplier
+pipeline — Thibault (a live REST API) and Kimpex (no API — a manual Excel
+upload) — removing manual re-entry for both.
 
 ## How it works
 
@@ -15,23 +16,26 @@ Order API, removing manual re-entry.
    `X-Shopify-Hmac-Sha256` header against an HMAC-SHA256 computed over the
    raw request body, using `SHOPIFY_WEBHOOK_SECRET` (constant-time
    comparison, not a plain string equality check).
-3. It checks Supabase for an existing `order_status` row for this Shopify
-   order ID — if this order was already processed (Shopify retries webhooks
-   on timeout), it skips silently.
+3. It checks Supabase for an existing `order_status` or `kimpex_pending_orders`
+   row for this Shopify order ID — if this order was already processed
+   (Shopify retries webhooks on timeout), it skips silently.
 4. For each distinct product on the order, it looks up that product's tags
-   via the Shopify Admin API (cached — see **Line item matching** below) and
-   keeps only the line items whose product carries the `Supplier-Thibault`
-   tag.
-5. If none match, it skips cleanly with no action.
-6. Otherwise, it builds one Thibault order request per SKU. For each one, it
-   writes a `pending` row to Supabase (see **Order status dashboard**), then
-   POSTs to `https://api.importationsthibault.com/api/v1/order` with a
-   Bearer token (`THIBAULT_API_TOKEN`), updating that row to `sent` or
-   `failed` once it resolves.
-7. Every outcome (success or failure per SKU) is logged to the console
-   (captured by Vercel's own Logs dashboard in production — nothing is
-   written to disk anywhere in this project, see **No filesystem writes**
-   below). On failure, a real alert email goes out via Resend — see
+   via the Shopify Admin API once (cached — see **Line item matching**
+   below) and checks each one against both `Supplier-Thibault` and
+   `Supplier-Kimpex`.
+5. If nothing matches either tag, it skips cleanly with no action.
+6. **Thibault-matched items**: builds one order request per SKU, writes a
+   `pending` row to Supabase (see **Order status dashboard**), then POSTs to
+   `https://api.importationsthibault.com/api/v1/order` with a Bearer token
+   (`THIBAULT_API_TOKEN`), updating that row to `sent` or `failed` once it
+   resolves.
+7. **Kimpex-matched items**: since Kimpex has no API, each matched line item
+   is simply recorded as a pending row in `kimpex_pending_orders` — see
+   **Kimpex order export** for how those turn into the actual upload file.
+8. Every outcome is logged to the console (captured by Vercel's own Logs
+   dashboard in production — nothing is written to disk anywhere in this
+   project, see **No filesystem writes** below). On a Thibault failure or
+   unresolved item, a real alert email goes out via Resend — see
    **Failure alerting**.
 
 ## Folder structure
@@ -39,7 +43,11 @@ Order API, removing manual re-entry.
 ```
 api/webhooks/orders-create.js   Main webhook handler (entry point)
 lib/verifyWebhook.js            Shopify HMAC signature verification
-lib/mapOrderToThibault.js       Tag-based line item filtering + Thibault payload building
+lib/lineItemTagging.js          Shared multi-tag line item matching (Thibault + Kimpex, one lookup pass)
+lib/mapOrderToThibault.js       Thibault-specific payload building (tag matching now in lineItemTagging.js)
+lib/mapOrderToKimpex.js         Kimpex-specific pending-order row building
+lib/kimpexOrders.js             Writes/reads kimpex_pending_orders rows
+lib/kimpexExport.js             Generates the Kimpex "Orders" upload .xlsx file
 lib/productTags.js              Product tag lookup orchestrator (cache, retries, mock/live switch)
 lib/productTagCache.js          Short-lived in-memory cache of product_id -> tags
 lib/shopifyAdminClient.js       Real Shopify Admin API product tag lookup
@@ -62,6 +70,9 @@ scripts/test-dashboard.js       Verifies a webhook run writes pending->sent/fail
 scripts/test-confirmation-tracking.js  Tests invoice/tracking response parsing + the Supabase round-trip
 scripts/test-readonly-fs.js     Simulates Vercel's read-only filesystem locally (see "No filesystem writes")
 scripts/test-raw-webhook-body.js  Tests the real raw-stream HMAC path (see "Raw webhook body & NODEJS_HELPERS")
+scripts/test-shipto-mississauga.js  Regression test for a real rejected order (see "Ship-to validation before sending")
+scripts/test-kimpex-order.js    Verifies a webhook run writes a correct row to kimpex_pending_orders
+scripts/test-kimpex-export.js   Verifies the generated .xlsx matches Kimpex's template exactly
 fixtures/sample-order.json      Sample Shopify order payload for testing
 fixtures/sample-order-with-unresolved-item.json  Multi-item order with one always-failing lookup
 fixtures/product-tags.json      Stubbed product_id -> tags map used by the mock lookup
@@ -184,30 +195,43 @@ silently mis-verifying.
 
 ## Line item matching
 
-Thibault-supplied products are identified **only by the `Supplier-Thibault`
-tag** on the product — never by vendor (vendor is always the real
-manufacturer/brand, e.g. "Puig", "K&S", "Athena", "Scar", "All Balls",
-"Pivot Works", "Koubalinks").
+Two distributors, matched **only by product tag** — never by vendor (vendor
+is always the real manufacturer/brand, e.g. "Puig", "K&S", "Athena", "Scar",
+"All Balls", "Pivot Works", "Koubalinks"):
+- `Supplier-Thibault` → forwarded to Thibault's Order API
+- `Supplier-Kimpex` → recorded for the manual Excel export (see **Kimpex
+  order export**) - Kimpex has no API
 
 The match is case-insensitive and whitespace-trimmed (`.trim().toLowerCase()`
-on both sides — see `lib/mapOrderToThibault.js`), since tags are free-text
-and can pick up inconsistent casing or stray spaces from manual entry.
+on both sides — see `lib/lineItemTagging.js`), since tags are free-text and
+can pick up inconsistent casing or stray spaces from manual entry.
 
 **Why a lookup is needed:** Shopify's `orders/create` webhook payload does
 not include per-line-item product tags — tags live on the product, not the
 line item. So for each distinct `product_id` on the incoming order, the
 handler calls the Shopify Admin API (`GET /admin/api/{version}/products/{id}.json`)
-to fetch that product's current tags, then checks for `Supplier-Thibault`.
-The full flow is:
+to fetch that product's current tags, then checks each one against both
+target tags. The full flow is:
 
 ```
 webhook receives order
   → distinct product_ids extracted from line_items
-  → each product's tags looked up individually (cached, retried, rate-limited)
-  → line items whose product has "Supplier-Thibault" are forwarded
-  → line items whose product has no such tag are excluded
-  → line items whose lookup never succeeded are logged as unresolved (see below)
+  → each product's tags looked up individually ONCE (cached, retried, rate-limited)
+  → checked against every target tag ("Supplier-Thibault", "Supplier-Kimpex")
+  → line items matching Supplier-Thibault are forwarded to Thibault's API
+  → line items matching Supplier-Kimpex are recorded for the Excel export
+  → line items matching neither are excluded from both
+  → line items whose lookup never succeeded are logged as unresolved (see below) -
+    once, not once per distributor being checked
 ```
+
+`lib/lineItemTagging.js`'s `getLineItemsByTags(order, targetTags)` does the
+lookup pass **once per distinct product regardless of how many target tags
+are checked** - an order with items for both distributors never doubles the
+Shopify Admin API calls (or, for a product whose lookup keeps failing, the
+retries). `lib/mapOrderToThibault.js` and `lib/mapOrderToKimpex.js` each
+just own their own tag constant (`THIBAULT_TAG` / `KIMPEX_TAG`) and their
+own payload/row-building logic.
 
 Lookups run **sequentially, not in parallel** (`lib/productTags.js`), with a
 ~550ms pause after each real Admin API call, to stay within Shopify's
@@ -327,6 +351,35 @@ Fields sent:
 The customer's **email is not sent to Thibault** — their API has no field for
 it, and Thibault doesn't email customers directly anyway. It's only visible
 in Shopify and in local logs.
+
+### Ship-to validation before sending
+
+Thibault's docs explicitly mark two `ship_to` fields **required for
+drop-ship dealers**: `state` (ISO 3166-2:CA province code, e.g. `"ON"` -
+sourced from `shipping_address.province_code`, never the full name like
+`"Ontario"` from `.province`) and `zip`. `validateShipTo()`
+(`lib/mapOrderToThibault.js`) checks both are present **before** calling
+Thibault, right in `api/webhooks/orders-create.js`. If either is missing,
+the SKU is marked `failed` immediately with a specific, actionable message
+- no wasted API call, no waiting on Thibault's response.
+
+This exists because of a real incident: a genuine Mississauga, ON order was
+rejected with `E017` ("Shipping address details are invalid in the request
+body"). Thibault's own error-code table gives **E016 and E017 the exact
+same description**, so their error never says which sub-field failed.
+Investigating turned up two things worth remembering:
+- `state` was **already** correctly sourced from `province_code`, not
+  `province` - that specific hypothesis didn't hold, confirmed by reading
+  the code directly rather than assuming.
+- Thibault's docs give **no format spec at all** for `zip` (no regex, no
+  guidance on the Canadian "with space" vs "without space" style) - so
+  nothing about zip formatting was changed; there was no documented basis
+  to "fix" a format that isn't specified anywhere.
+
+`npm run test:shipto-mississauga` uses the exact real address (Mississauga,
+ON, `L5T 1G3`) to confirm it maps correctly and passes `validateShipTo()`,
+and separately confirms the same function catches a genuinely missing
+`state`/`zip`.
 
 ## Failure alerting
 
@@ -542,6 +595,106 @@ Both require `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` to be set, and
 the `order_status` table (with the confirmation/tracking columns above) to
 actually exist - they'll say so clearly rather than silently passing.
 
+## Kimpex order export
+
+Kimpex has **no API** - their orders go out as a manually-uploaded Excel
+file through their B2B portal, not a live call like Thibault's. So instead
+of sending anything, `Supplier-Kimpex`-tagged line items are just recorded
+as pending rows, and a dashboard button turns them into the exact file
+Kimpex's upload screen expects, on demand.
+
+```sql
+create table kimpex_pending_orders (
+  id bigint generated always as identity primary key,
+  shopify_order_id text not null,
+  order_number text not null,
+  recipient_name text,
+  ship_address_1 text,
+  ship_address_2 text,
+  ship_address_3 text,
+  ship_city text,
+  ship_postal_code text,
+  ship_state text,
+  ship_country text,
+  buyer_phone_number text,
+  buyer_email text,
+  sku text,
+  product_name text,
+  quantity_purchased integer,
+  item_price numeric,
+  exported boolean default false,
+  created_at timestamptz default now()
+);
+```
+
+**Writing** (`lib/mapOrderToKimpex.js` builds the rows, `lib/kimpexOrders.js`
+writes them, wired into `api/webhooks/orders-create.js`): one row per
+Kimpex-matched line item, inserted as soon as the order is processed. Rows
+are **never deleted** - `exported` just flips to `true`, so the table
+doubles as a permanent record of everything ever sent to Kimpex.
+
+Two formatting lessons, both confirmed directly from Kimpex's own upload
+documentation rather than guessed (the second one nearly repeating the
+exact mistake almost made with Thibault's `state` field earlier in this
+project):
+- **`ship_state`** must be the 2-letter province/state code
+  (`shipping_address.province_code`, e.g. `"ON"`) - their own upload-error
+  list: *"Province does not match our data. We recommend entering the
+  2-letter code for the province or state. Example: QC for Quebec."*
+- **`ship_country`** must be the 2-letter country code
+  (`shipping_address.country_code`, e.g. `"CA"`), not the full name - same
+  doc: *"Country does not match our data. We recommend entering the
+  2-letter country code. Example: CA for Canada."*
+
+**The export** (`lib/kimpexExport.js`, via the "Download Kimpex Export"
+button on the dashboard): queries every row where `exported = false`,
+generates a real `.xlsx` (sheet named `"Orders"`, these 15 headers in this
+exact order - confirmed directly against Kimpex's reference template
+`DropShip E-Market - EN 1.xlsx` and their upload-instructions doc, not
+guessed):
+
+```
+order-id, recipient-name, ship-address-1, ship-address-2, ship-address-3,
+ship-city, ship-postal-code, ship-state, ship-country, buyer-phone-number,
+buyer-email, sku, product-name, quantity-purchased, item-price
+```
+
+`order-id` is the Shopify order **number** (e.g. `#1042`, matching what
+`customer_refs` uses for Thibault) - Kimpex's own doc calls this "the
+e-Market order number," an external reference, not our internal database
+id. Downloading triggers a real browser file download (via
+`Content-Disposition: attachment` on a plain form POST - no client-side JS
+needed), then marks exactly the rows that were included as
+`exported: true`. If nothing is pending, the button does nothing rather
+than downloading a pointless empty file.
+
+Uses [`exceljs`](https://www.npmjs.com/package/exceljs), not the more
+commonly-seen `xlsx` (SheetJS) package - `xlsx` has a **high-severity
+prototype-pollution advisory with no fix available** on npm. Since this
+project only ever *writes* `.xlsx` files (never parses untrusted uploads),
+the practical risk was low either way, but there was no reason to accept
+it when a well-maintained alternative exists.
+
+**Dashboard section**: a second table below the Thibault one, showing order
+#, SKU, a pending/exported badge, and timestamp for the most recent 100
+rows - no confirmation/tracking columns, since there's no API to check
+those against.
+
+**Testing locally:**
+```
+npm run test:kimpex-order
+npm run test:kimpex-export
+```
+`test:kimpex-order` sends a real webhook (via real Supabase, like
+`test:dashboard`) for an order with a Kimpex-tagged item **and** a
+Thibault-tagged item together, confirming both distributors process
+independently in the same order, the Kimpex row lands with the right
+2-letter province/country codes, and cleans up its own test rows
+afterward. `test:kimpex-export` is hermetic (no `.env`, no network) -
+builds a workbook from sample rows and parses the result back with
+`exceljs` to confirm the sheet name and header row match Kimpex's template
+exactly.
+
 ## Environment variables
 
 Copy `.env.example` to `.env` and fill in:
@@ -664,8 +817,9 @@ dropped, never miscounted as "not Thibault."
 
 **Working:**
 - HMAC webhook verification (constant-time comparison)
-- `Supplier-Thibault` tag-based line item filtering, via a real (or mocked)
-  Shopify Admin API lookup — case-insensitive, whitespace-trimmed
+- `Supplier-Thibault` and `Supplier-Kimpex` tag-based line item filtering,
+  via a real (or mocked) Shopify Admin API lookup — case-insensitive,
+  whitespace-trimmed, one lookup pass covers both (see **Line item matching**)
 - Sequential, rate-limit-aware product tag lookups with a 1-hour in-memory
   cache, retried on failure, with unresolved items tracked separately
   rather than dropped or misclassified (see **Retries and unresolved items**)
@@ -690,6 +844,10 @@ dropped, never miscounted as "not Thibault."
   `/tracking` endpoints (read-only GETs, response shapes confirmed against
   their docs) — real parsing/writing logic, gated the same way as
   everything else behind `THIBAULT_LIVE_CALLS_ENABLED`
+- Kimpex order recording + Excel export (`kimpex_pending_orders`, the
+  "Download Kimpex Export" button) — real, not a stub. Kimpex has no API to
+  gate behind a live-calls flag; the export itself is the "send" step, done
+  manually by uploading the downloaded file to their B2B portal
 
 **Stubbed / disabled by design:**
 - **Real Thibault API calls are off by default** — see **Thibault live

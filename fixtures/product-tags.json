@@ -1,7 +1,8 @@
 {
-  "_comment": "Stubbed Shopify Admin API product tag lookups, keyed by product_id, used by lib/shopifyAdminMock.js when SHOPIFY_CLIENT_ID/SHOPIFY_CLIENT_SECRET aren't set. product_id 7001234999 deliberately has inconsistent casing/spacing on its tag to exercise the normalized (trim + lowercase) match. product_id 7005550001 always throws (__simulateError), to exercise the retry + unresolved-item path - see scripts/test-unresolved-item.js.",
+  "_comment": "Stubbed Shopify Admin API product tag lookups, keyed by product_id, used by lib/shopifyAdminMock.js when SHOPIFY_CLIENT_ID/SHOPIFY_CLIENT_SECRET aren't set. product_id 7001234999 deliberately has inconsistent casing/spacing on its tag to exercise the normalized (trim + lowercase) match. product_id 7005550001 always throws (__simulateError), to exercise the retry + unresolved-item path - see scripts/test-unresolved-item.js. product_id 7002234567 is tagged Supplier-Kimpex, for Kimpex-specific tests.",
   "7001234567": ["Supplier-Thibault", "Suspension"],
   "7001234999": ["Windscreens & Fairings", "  supplier-thibault  "],
   "7009998888": ["Windscreens & Fairings", "Suspension"],
-  "7005550001": { "__simulateError": "Simulated Shopify Admin API failure (404 Not Found)" }
+  "7005550001": { "__simulateError": "Simulated Shopify Admin API failure (404 Not Found)" },
+  "7002234567": ["Supplier-Kimpex", "Helmets"]
 }
