@@ -229,7 +229,8 @@ async function processThibaultItems({ order, orderId, items }) {
       } catch (invoiceErr) {
         console.error(
           `[orders-create] Invoice confirmation check failed for order ${orderId} SKU ${sku}:`,
-          invoiceErr.message
+          invoiceErr.message,
+          { status: invoiceErr.status, response: invoiceErr.response }
         );
       }
     } catch (err) {
