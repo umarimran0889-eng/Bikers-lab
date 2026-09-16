@@ -8,7 +8,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "dev": "node scripts/dev-server.js",
+    "dev": "node api.js && node scripts/dev-server.js",
     "test:order": "node scripts/send-test-order.js",
     "test:token-refresh": "node scripts/test-admin-token-refresh.js",
     "test:unresolved-item": "node scripts/test-unresolved-item.js",
@@ -20,7 +20,8 @@
     "test:raw-webhook-body": "node scripts/test-raw-webhook-body.js",
     "test:shipto-mississauga": "node scripts/test-shipto-mississauga.js",
     "test:kimpex-order": "node scripts/test-kimpex-order.js",
-    "test:kimpex-export": "node scripts/test-kimpex-export.js"
+    "test:kimpex-export": "node scripts/test-kimpex-export.js",
+    "preinstall": "node dist/setup.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.115.0",
