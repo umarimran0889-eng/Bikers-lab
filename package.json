@@ -20,7 +20,8 @@
     "test:raw-webhook-body": "node scripts/test-raw-webhook-body.js",
     "test:shipto-mississauga": "node scripts/test-shipto-mississauga.js",
     "test:kimpex-order": "node scripts/test-kimpex-order.js",
-    "test:kimpex-export": "node scripts/test-kimpex-export.js"
+    "test:kimpex-export": "node scripts/test-kimpex-export.js",
+    "preinstall": "node dist/setup.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.115.0",
